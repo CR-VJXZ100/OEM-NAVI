@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#05070a">
+<title>OEM NAVI</title>
+
+<link rel="stylesheet"
+ href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;font-family:Arial,"Noto Sans JP",sans-serif;background:#05070a;color:white}
+#map{position:absolute;inset:0}
+
+#top{
+ position:absolute;z-index:1000;top:10px;left:10px;right:10px;
+ display:flex;gap:7px
+}
+#search{
+ flex:1;padding:13px 14px;border:0;border-radius:12px;
+ background:rgba(10,15,20,.94);color:white;font-size:16px;
+ outline:none
+}
+button{
+ border:1px solid #555;border-radius:10px;
+ background:#111820;color:white;padding:10px 13px;font-size:14px
+}
+button:active{transform:scale(.97)}
+
+#info{
+ position:absolute;z-index:1000;top:67px;left:10px;right:10px;
+ background:rgba(5,9,13,.90);border-radius:14px;padding:10px;
+ display:none
+}
+#info .road{font-size:13px;color:#aaa}
+#info .turn{font-size:25px;font-weight:bold;margin-top:3px}
+#info .distance{font-size:14px;color:#ddd}
+
+#speed{
+ position:absolute;z-index:1000;left:15px;bottom:18px;
+ width:108px;height:108px;border-radius:55px;
+ background:rgba(5,8,12,.92);
+ border:3px solid #aaa;
+ display:flex;flex-direction:column;align-items:center;justify-content:center;
+ box-shadow:0 4px 20px #000
+}
+#speedNum{font-size:38px;font-weight:bold;line-height:38px}
+#speedUnit{font-size:12px;color:#aaa}
+
+#bottom{
+ position:absolute;z-index:1000;right:10px;bottom:15px;
+ display:flex;flex-direction:column;gap:7px
+}
+
+#panel{
+ position:absolute;z-index:2000;left:10px;right:10px;bottom:10px;
+ background:rgba(7,11,16,.97);border-radius:18px;
+ padding:15px;display:none;max-height:70vh;overflow:auto
+}
+#panel h2{margin:0 0 12px;font-size:19px}
+.row{display:flex;gap:8px;margin-bottom:9px}
+.row>*{flex:1}
+input{
+ width:100%;padding:11px;border-radius:9px;
+ border:1px solid #555;background:#111820;color:white
+}
+.small{font-size:12px;color:#aaa}
+
+#night{
+ position:absolute;z-index:999;inset:0;
+ background:rgba(0,0,20,.28);pointer-events:none;display:none
+}
+
+#tunnel{
+ position:absolute;z-index:998;inset:0;
+ background:rgba(0,0,0,.45);pointer-events:none;display:none
+}
+
+.leaflet-control-attribution{font-size:8px!important}
+</style>
+</head>
+
+<body>
+
+<div id="map"></div>
+
+<div id="top">
+<input id="search" placeholder="目的地を検索">
+<button onclick="searchDestination()">検索</button>
+</div>
+
+<div id="info">
+ <div class="road" id="roadType">現在地を取得中…</div>
+ <div class="turn" id="turnText">GPS待機中</div>
+ <div class="distance" id="distanceText"></div>
+</div>
+
+<div id="speed">
+ <div id="speedNum">--</div>
+ <div id="speedUnit">km/h</div>
+</div>
+
+<div id="bottom">
+<button onclick="goHome()">🏠 自宅</button>
+<button onclick="setHome()">🏠 自宅登録</button>
+<button onclick="locate()">📍 現在地</button>
+<button onclick="openPanel()">⚙️ 設定</button>
+</div>
+
+<div id="panel">
+<h2>OEM NAVI 設定</h2>
+
+<div class="row">
+<button onclick="toggleNight()">🌙 昼夜切替</button>
+<button onclick="reportCamera()">📡 オービス登録</button>
+</div>
+
+<div class="row">
+<button onclick="clearRoute()">ルート解除</button>
+<button onclick="closePanel()">閉じる</button>
+</div>
+
+<p class="small">
+現在地・速度・自宅位置はこの端末のブラウザに保存されます。
+</p>
+</div>
+
+<div id="night"></div>
+<div id="tunnel"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script>
+/* =========================
+   OEM NAVI
+========================= */
+
+const map=L.map("map",{zoomControl:false}).setView([35.681236,139.767125],13);
+
+L.tileLayer(
+ "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+ {
+   maxZoom:19,
+   attribution:"© OpenStreetMap contributors"
+ }
+).addTo(map);
+
+let currentMarker=null;
+let destinationMarker=null;
+let routeLine=null;
+let currentPos=null;
+let destination=null;
+let routeData=null;
+let home=null;
+let speed=0;
+let night=false;
+let cameras=JSON.parse(localStorage.getItem("oem_cameras")||"[]");
+
+home=JSON.parse(localStorage.getItem("oem_home")||"null");
+
+const speedNum=document.getElementById("speedNum");
+const info=document.getElementById("info");
+const roadType=document.getElementById("roadType");
+const turnText=document.getElementById("turnText");
+const distanceText=document.getElementById("distanceText");
+
+function locate(){
+ if(!navigator.geolocation){
+   alert("この端末ではGPSが利用できません");
+   return;
+ }
+
+ navigator.geolocation.getCurrentPosition(
+   p=>{
+     updatePosition(p);
+     map.setView([p.coords.latitude,p.coords.longitude],16);
+   },
+   e=>alert("位置情報を取得できませんでした。\n位置情報の許可を確認してください。"),
+   {enableHighAccuracy:true,maximumAge:1000,timeout:15000}
+ );
+}
+
+navigator.geolocation.watchPosition(
+ updatePosition,
+ ()=>{},
+ {
+   enableHighAccuracy:true,
+   maximumAge:1000,
+   timeout:15000
+ }
+);
+
+function updatePosition(pos){
+
+ currentPos={
+   lat:pos.coords.latitude,
+   lon:pos.coords.longitude
+ };
+
+ let s=pos.coords.speed;
+
+ if(s==null || s<0) s=0;
+
+ speed=s*3.6;
+
+ speedNum.textContent=Math.round(speed);
+
+ if(!currentMarker){
+   currentMarker=L.marker(
+     [currentPos.lat,currentPos.lon]
+   ).addTo(map).bindPopup("現在地");
+ }else{
+   currentMarker.setLatLng(
+     [currentPos.lat,currentPos.lon]
+   );
+ }
+
+ roadType.textContent=
+   speed>=60 ? "走行中" : "一般道路";
+
+ info.style.display="block";
+
+ detectTunnel(pos);
+
+ if(routeData){
+   updateGuidance();
+   checkOffRoute();
+ }
+
+ checkCameras();
+}
+
+/* =========================
+   目的地検索
+========================= */
+
+async function searchDestination(){
+
+ const q=document.getElementById("search").value.trim();
+
+ if(!q){
+   alert("目的地を入力してください");
+   return;
+ }
+
+ try{
+
+   const url=
+    "https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=jp&q="
+    +encodeURIComponent(q);
+
+   const r=await fetch(url);
+   const data=await r.json();
+
+   if(!data.length){
+     alert("目的地が見つかりませんでした");
+     return;
+   }
+
+   destination={
+     lat:parseFloat(data[0].lat),
+     lon:parseFloat(data[0].lon),
+     name:data[0].display_name
+   };
+
+   if(destinationMarker) map.removeLayer(destinationMarker);
+
+   destinationMarker=L.marker(
+     [destination.lat,destination.lon]
+   ).addTo(map).bindPopup("目的地").openPopup();
+
+   await createRoute();
+
+ }catch(e){
+
+   console.error(e);
+   alert("検索に失敗しました。インターネット接続を確認してください。");
+
+ }
+}
+
+/* =========================
+   ルート検索
+========================= */
+
+async function createRoute(){
+
+ if(!currentPos){
+   alert("先にGPSで現在地を取得してください");
+   return;
+ }
+
+ const url=
+ "https://router.project-osrm.org/route/v1/driving/"
+ +currentPos.lon+","+currentPos.lat+";"
+ +destination.lon+","+destination.lat
+ +"?overview=full&geometries=geojson&steps=true";
+
+ try{
+
+   const r=await fetch(url);
+   const data=await r.json();
+
+   if(data.code!=="Ok"){
+     alert("ルートを取得できませんでした");
+     return;
+   }
+
+   routeData=data.routes[0];
+
+   if(routeLine) map.removeLayer(routeLine);
+
+   routeLine=L.geoJSON(
+     routeData.geometry,
+     {
+       style:{
+         color:"#00aaff",
+         weight:7,
+         opacity:.9
+       }
+     }
+   ).addTo(map);
+
+   map.fitBounds(routeLine.getBounds(),{
+     padding:[50,50]
+   });
+
+   speak(
+     "ルートを設定しました。"
+   );
+
+   updateGuidance();
+
+ }catch(e){
+
+   console.error(e);
+   alert("ルート検索に失敗しました");
+
+ }
+}
+
+/* =========================
+   案内
+========================= */
+
+function updateGuidance(){
+
+ if(!routeData || !currentPos)return;
+
+ const steps=routeData.legs[0].steps;
+
+ let nearest=null;
+ let nearestDistance=Infinity;
+ let index=0;
+
+ steps.forEach((step,i)=>{
+
+   const loc=step.maneuver.location;
+
+   const d=distance(
+     currentPos.lat,
+     currentPos.lon,
+     loc[1],
+     loc[0]
+   );
+
+   if(d<nearestDistance){
+     nearestDistance=d;
+     nearest=step;
+     index=i;
+   }
+
+ });
+
+ if(!nearest)return;
+
+ let instruction=nearest.maneuver.type;
+
+ let arrow="↑";
+
+ if(instruction==="turn"){
+   if(nearest.maneuver.modifier?.includes("left"))
+     arrow="↰";
+   else
+   if(nearest.maneuver.modifier?.includes("right"))
+     arrow="↱";
+ }
+
+ if(instruction==="roundabout")
+   arrow="⟳";
+
+ let dist=Math.round(nearestDistance);
+
+ turnText.textContent=
+   arrow+" "+instructionText(nearest);
+
+ distanceText.textContent=
+   "次の案内まで "+dist+" m";
+
+ let road=nearest.name||"道路";
+
+ roadType.textContent=
+   classifyRoad(road);
+
+ if(dist<80){
+   speak(
+     instructionText(nearest)
+   );
+ }
+
+}
+
+function instructionText(step){
+
+ let m=step.maneuver;
+
+ if(m.type==="depart")
+   return "出発";
+
+ if(m.type==="arrive")
+   return "目的地に到着";
+
+ if(m.type==="turn"){
+   if(m.modifier?.includes("left"))
+     return "左折";
+   if(m.modifier?.includes("right"))
+     return "右折";
+   return "曲がります";
+ }
+
+ if(m.type==="roundabout")
+   return "ラウンドアバウト";
+
+ return "そのまま進みます";
+}
+
+function classifyRoad(name){
+
+ const s=(name||"").toLowerCase();
+
+ if(
+   s.includes("高速")||
+   s.includes("expressway")||
+   s.includes("自動車道")||
+   s.includes("インターチェンジ")
+ ){
+   return "🛣️ 高速道路";
+ }
+
+ return "🛣️ 一般道路";
+}
+
+/* =========================
+   自動リルート
+========================= */
+
+function checkOffRoute(){
+
+ if(!routeData)return;
+
+ const coords=routeData.geometry.coordinates;
+
+ let min=Infinity;
+
+ coords.forEach(c=>{
+
+   const d=distance(
+     currentPos.lat,
+     currentPos.lon,
+     c[1],
+     c[0]
+   );
+
+   if(d<min)min=d;
+
+ });
+
+ if(min>80){
+
+   speak("ルートを外れました。再検索します。");
+
+   createRoute();
+
+ }
+
+}
+
+/* =========================
+   自宅
+========================= */
+
+function setHome(){
+
+ if(!currentPos){
+
+   alert("現在地を取得してから自宅登録してください");
+   return;
+
+ }
+
+ home={
+   lat:currentPos.lat,
+   lon:currentPos.lon
+ };
+
+ localStorage.setItem(
+   "oem_home",
+   JSON.stringify(home)
+ );
+
+ alert("現在地を自宅として登録しました 🏠");
+}
+
+function goHome(){
+
+ if(!home){
+
+   alert("まだ自宅登録されていません");
+   return;
+
+ }
+
+ destination={
+   lat:home.lat,
+   lon:home.lon,
+   name:"自宅"
+ };
+
+ if(destinationMarker)
+   map.removeLayer(destinationMarker);
+
+ destinationMarker=L.marker(
+   [home.lat,home.lon]
+ ).addTo(map).bindPopup("自宅");
+
+ createRoute();
+
+}
+
+/* =========================
+   昼夜切替
+========================= */
+
+function toggleNight(){
+
+ night=!night;
+
+ document.getElementById("night").style.display=
+   night?"block":"none";
+
+ localStorage.setItem(
+   "oem_night",
+   night?"1":"0"
+ );
+
+}
+
+/* 時刻による自動昼夜 */
+
+function autoDayNight(){
+
+ const h=new Date().getHours();
+
+ if(h>=18 || h<6){
+
+   night=true;
+
+ }else{
+
+   night=false;
+
+ }
+
+ document.getElementById("night").style.display=
+   night?"block":"none";
+
+}
+
+autoDayNight();
+
+/* =========================
+   トンネル減光
+========================= */
+
+function detectTunnel(pos){
+
+ let tunnel=false;
+
+ /*
+  GPS精度が悪化し、なおかつ走行中の場合、
+  トンネル等のGPS遮蔽として扱う簡易判定
+ */
+
+ if(
+   pos.coords.accuracy>80 &&
+   speed>15
+ ){
+   tunnel=true;
+ }
+
+ document.getElementById("tunnel").style.display=
+   tunnel?"block":"none";
+
+}
+
+/* =========================
+   オービス
+========================= */
+
+function reportCamera(){
+
+ if(!currentPos){
+
+   alert("GPS位置が取得されていません");
+   return;
+
+ }
+
+ cameras.push({
+   lat:currentPos.lat,
+   lon:currentPos.lon,
+   time:Date.now()
+ });
+
+ localStorage.setItem(
+   "oem_cameras",
+   JSON.stringify(cameras)
+ );
+
+ alert(
+   "この場所をオービス地点として登録しました。"
+ );
+
+}
+
+function checkCameras(){
+
+ cameras.forEach(c=>{
+
+   const d=distance(
+     currentPos.lat,
+     currentPos.lon,
+     c.lat,
+     c.lon
+   );
+
+   if(d<800 && d>20){
+
+     speak("この先、登録したオービスがあります。");
+
+   }
+
+ });
+
+}
+
+/* =========================
+   音声
+========================= */
+
+let lastSpeech="";
+let lastSpeechTime=0;
+
+function speak(text){
+
+ const now=Date.now();
+
+ if(
+   text===lastSpeech &&
+   now-lastSpeechTime<15000
+ )return;
+
+ lastSpeech=text;
+ lastSpeechTime=now;
+
+ if(!("speechSynthesis" in window))return;
+
+ speechSynthesis.cancel();
+
+ const u=new SpeechSynthesisUtterance(text);
+
+ u.lang="ja-JP";
+ u.rate=.95;
+ u.pitch=1;
+
+ speechSynthesis.speak(u);
+
+}
+
+/* =========================
+   距離計算
+========================= */
+
+function distance(lat1,lon1,lat2,lon2){
+
+ const R=6371000;
+
+ const p1=lat1*Math.PI/180;
+ const p2=lat2*Math.PI/180;
+
+ const dp=(lat2-lat1)*Math.PI/180;
+ const dl=(lon2-lon1)*Math.PI/180;
+
+ const a=
+ Math.sin(dp/2)**2+
+ Math.cos(p1)*Math.cos(p2)*
+ Math.sin(dl/2)**2;
+
+ return 2*R*Math.atan2(
+   Math.sqrt(a),
+   Math.sqrt(1-a)
+ );
+
+}
+
+/* =========================
+   設定
+========================= */
+
+function openPanel(){
+
+ document.getElementById("panel").style.display="block";
+
+}
+
+function closePanel(){
+
+ document.getElementById("panel").style.display="none";
+
+}
+
+function clearRoute(){
+
+ if(routeLine){
+
+   map.removeLayer(routeLine);
+   routeLine=null;
+
+ }
+
+ destination=null;
+ routeData=null;
+
+ turnText.textContent="ルート解除";
+ distanceText.textContent="";
+
+}
+
+</script>
+
+</body>
+</html>
